@@ -1,13 +1,9 @@
-#!/usr/bin/env python3
-"""Write our news front page to the make.fun output location.
+"""Copy the bundled entry image to the output directory after validation.
 
-The picture ships in this repository as ``entry.png`` next to this file.
-Before copying, the program checks the file against the competition's
-own limits (a whole PNG or JPEG, at most 1 MiB, at most 1024 by 1024
-pixels), then copies it, byte for byte, to ``entry.png`` inside the
-output directory (``MAKEFUN_OUTPUT_DIR`` when set, otherwise
-``/output``). Two runs always write the same bytes: the source file is
-never modified.
+The bundled file is always called entry.png next to this script, even
+when its actual bytes are JPEG. We check the size, sniff the real format
+from the magic bytes, extract the pixel dimensions, and only then copy
+the file verbatim.
 """
 
 import os
@@ -15,67 +11,88 @@ import struct
 import sys
 from pathlib import Path
 
-SOURCE = Path(__file__).resolve().with_name("entry.png")
-MAX_BYTES = 1_048_576
-MAX_SIDE = 1024
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-JPEG_SIGNATURE = b"\xff\xd8\xff"
+LIMIT_BYTES = 1_048_576
+LIMIT_DIM = 1024
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def fail(reason: str) -> None:
+    print(f"error: {reason}", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def png_dimensions(data: bytes) -> tuple[int, int]:
-    """Read (width, height) from the PNG IHDR chunk."""
-    if len(data) < 24 or data[12:16] != b"IHDR":
-        raise ValueError("PNG file has no IHDR chunk")
-    return struct.unpack(">II", data[16:24])
+    # Need at least signature (8) + length (4) + type (4) + width/height (8)
+    if len(data) < 24:
+        fail("PNG data too short to contain an IHDR chunk")
+    if data[12:16] != b"IHDR":
+        fail("PNG is missing its IHDR chunk")
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
 
 
 def jpeg_dimensions(data: bytes) -> tuple[int, int]:
-    """Read (width, height) from the first JPEG SOF0/SOF2 segment."""
-    pos = 2
-    while pos + 4 <= len(data):
+    # Walk JPEG segments looking for SOF0 (0xC0) or SOF2 (0xC2).
+    pos = 2  # skip the SOI marker we already matched
+    total = len(data)
+    while pos + 4 <= total:
         if data[pos] != 0xFF:
-            raise ValueError("JPEG segment does not start with a marker")
+            fail("corrupt JPEG: expected a segment marker")
         marker = data[pos + 1]
-        length = struct.unpack(">H", data[pos + 2 : pos + 4])[0]
+        # Standalone markers have no length field.
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            pos += 2
+            continue
+        seg_len = struct.unpack(">H", data[pos + 2 : pos + 4])[0]
+        if seg_len < 2 or pos + 2 + seg_len > total:
+            fail("corrupt JPEG: segment length out of range")
         if marker in (0xC0, 0xC2):
-            height, width = struct.unpack(">HH", data[pos + 5 : pos + 9])
+            if seg_len < 7:
+                fail("corrupt JPEG: frame header too short")
+            # Layout after length: precision (1), height (2), width (2)
+            height = struct.unpack(">H", data[pos + 5 : pos + 7])[0]
+            width = struct.unpack(">H", data[pos + 7 : pos + 9])[0]
             return width, height
-        pos += 2 + length
-    raise ValueError("JPEG file has no SOF segment")
+        if marker == 0xDA:
+            break  # start of scan, no frame header found before image data
+        pos += 2 + seg_len
+    fail("could not locate a JPEG frame header (SOF0/SOF2)")
+    return 0, 0  # unreachable, keeps type checkers quiet
 
 
-def check_image(data: bytes) -> str:
-    """Validate size and dimensions; return the detected format name."""
-    if len(data) > MAX_BYTES:
-        raise ValueError(f"image is {len(data)} bytes, over the {MAX_BYTES} cap")
-    if data.startswith(PNG_SIGNATURE):
+def inspect_image(data: bytes) -> tuple[int, int]:
+    if len(data) == 0:
+        fail("bundled image is empty")
+    if len(data) > LIMIT_BYTES:
+        fail(f"image is {len(data)} bytes, over the {LIMIT_BYTES} byte limit")
+    if data.startswith(PNG_MAGIC):
         width, height = png_dimensions(data)
-        kind = "PNG"
-    elif data.startswith(JPEG_SIGNATURE):
+    elif data[:2] == b"\xff\xd8":
         width, height = jpeg_dimensions(data)
-        kind = "JPEG"
     else:
-        found = data[:4].hex() if data else "no bytes (empty file)"
-        raise ValueError(f"unsupported image format: found {found}")
-    if width > MAX_SIDE or height > MAX_SIDE:
-        raise ValueError(f"image is {width}x{height}, over the {MAX_SIDE}px cap")
-    return f"{kind} {width}x{height}"
+        fail("unrecognised image format: not PNG or JPEG")
+    for label, value in (("width", width), ("height", height)):
+        if not 1 <= value <= LIMIT_DIM:
+            fail(f"{label} {value} is outside the allowed 1..{LIMIT_DIM} range")
+    return width, height
 
 
-def main() -> int:
-    data = SOURCE.read_bytes()
-    description = check_image(data)
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / "entry.png"
-    with target.open("wb") as handle:
-        handle.write(data)
-    written = target.stat().st_size
-    if written != len(data):
-        raise IOError(f"wrote {written} of {len(data)} bytes to {target}")
-    print(f"wrote {target} ({written} bytes, {description})")
-    return 0
+def main() -> None:
+    here = Path(__file__).resolve().parent
+    source = here / "entry.png"
+    if not source.is_file():
+        fail(f"bundled image not found at {source}")
+
+    payload = source.read_bytes()
+    width, height = inspect_image(payload)
+
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / "entry.png"
+    target.write_bytes(payload)
+
+    print(f"wrote {target} ({len(payload)} bytes, {width}x{height})")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
