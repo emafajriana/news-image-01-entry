@@ -6,6 +6,7 @@ from the magic bytes, extract the pixel dimensions, and only then copy
 the file verbatim.
 """
 
+import hashlib
 import os
 import struct
 import sys
@@ -24,9 +25,9 @@ def fail(reason: str) -> None:
 def png_dimensions(data: bytes) -> tuple[int, int]:
     # Need at least signature (8) + length (4) + type (4) + width/height (8)
     if len(data) < 24:
-        fail("PNG data too short to contain an IHDR chunk")
+        fail(f"PNG data measured {len(data)} bytes, need at least 24 bytes for IHDR (limit {LIMIT_BYTES} bytes max)")
     if data[12:16] != b"IHDR":
-        fail("PNG is missing its IHDR chunk")
+        fail(f"PNG is missing its IHDR chunk: found {data[12:16]!r} at offset 12, size {len(data)} bytes")
     width, height = struct.unpack(">II", data[16:24])
     return width, height
 
@@ -60,21 +61,26 @@ def jpeg_dimensions(data: bytes) -> tuple[int, int]:
     return 0, 0  # unreachable, keeps type checkers quiet
 
 
-def inspect_image(data: bytes) -> tuple[int, int]:
+def inspect_image(data: bytes) -> tuple[int, int, str]:
     if len(data) == 0:
-        fail("bundled image is empty")
+        fail(f"bundled image is empty: measured 0 bytes, need 1..{LIMIT_BYTES} bytes")
     if len(data) > LIMIT_BYTES:
-        fail(f"image is {len(data)} bytes, over the {LIMIT_BYTES} byte limit")
+        fail(f"image size {len(data)} bytes violates the {LIMIT_BYTES} byte limit")
     if data.startswith(PNG_MAGIC):
+        fmt = "PNG"
         width, height = png_dimensions(data)
     elif data[:2] == b"\xff\xd8":
+        fmt = "JPEG"
         width, height = jpeg_dimensions(data)
     else:
-        fail("unrecognised image format: not PNG or JPEG")
+        fail(
+            f"unrecognised image format: first bytes {data[:8].hex()} "
+            f"(size {len(data)} bytes, limit {LIMIT_BYTES}) are neither PNG nor JPEG"
+        )
     for label, value in (("width", width), ("height", height)):
         if not 1 <= value <= LIMIT_DIM:
-            fail(f"{label} {value} is outside the allowed 1..{LIMIT_DIM} range")
-    return width, height
+            fail(f"{label} measured {value}px violates the 1..{LIMIT_DIM}px limit")
+    return width, height, fmt
 
 
 def main() -> None:
@@ -84,14 +90,15 @@ def main() -> None:
         fail(f"bundled image not found at {source}")
 
     payload = source.read_bytes()
-    width, height = inspect_image(payload)
+    width, height, fmt = inspect_image(payload)
 
     out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / "entry.png"
     target.write_bytes(payload)
 
-    print(f"wrote {target} ({len(payload)} bytes, {width}x{height})")
+    digest = hashlib.sha256(payload).hexdigest()
+    print(f"wrote {target} ({len(payload)} bytes, {width}x{height}, {fmt}, sha256={digest})")
 
 
 if __name__ == "__main__":
